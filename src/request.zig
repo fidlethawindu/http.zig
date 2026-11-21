@@ -1455,6 +1455,9 @@ const allowedHeaderValueByte = blk: {
     for ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_ :;.,/\"'?!(){}[]@<>=-+*#$&`|~^%\t\\") |b| {
         v[b] = true;
     }
+    // obs-text (RFC 9110 section 5.5): a field value may hold bytes 0x80 to 0xFF, which a receiver treats as opaque. Edges and proxies send names with
+    // accents (a visitor's city) as UTF-8 in such a value, and refusing the whole request for it would refuse everyone who lives there.
+    for (0x80..0x100) |b| v[b] = true;
     break :blk v;
 };
 
@@ -1510,18 +1513,42 @@ test "atoi" {
 }
 
 test "allowedHeaderValueByte" {
-    var all = std.mem.zeroes([255]bool);
+    var all = std.mem.zeroes([256]bool);
     for ('a'..('z' + 1)) |b| all[b] = true;
     for ('A'..('Z' + 1)) |b| all[b] = true;
     for ('0'..('9' + 1)) |b| all[b] = true;
     for ([_]u8{ '_', ' ', ',', ':', ';', '.', ',', '\\', '/', '"', '\'', '?', '!', '(', ')', '{', '}', '[', ']', '@', '<', '>', '=', '-', '+', '*', '#', '$', '&', '`', '|', '~', '^', '%', '\t' }) |b| {
         all[b] = true;
     }
-    for (128..255) |b| all[b] = false;
+    for (128..256) |b| all[b] = true;
 
     for (all, 0..) |allowed, b| {
         try t.expectEqual(allowed, allowedHeaderValueByte[@intCast(b)]);
     }
+}
+
+test "request: a header value may hold bytes above 127, which reach the handler as they were sent" {
+    defer t.reset();
+    {
+        var r = try testParse("GET / HTTP/1.1\r\nCf-Ipcity: Z\xc3\xbcrich\r\nHost: pondzpondz.com\r\n\r\n", .{});
+        try t.expectEqual(2, r.headers.len);
+        try t.expectString("Z\xc3\xbcrich", r.header("cf-ipcity").?);
+        try t.expectString("pondzpondz.com", r.header("host").?);
+    }
+    {
+        var r = try testParse("GET / HTTP/1.1\r\nCity: Z\xfcrich\r\n\r\n", .{});
+        try t.expectString("Z\xfcrich", r.header("city").?);
+    }
+    {
+        var r = try testParse("GET / HTTP/1.1\r\nCity: \xff\r\n\r\n", .{});
+        try t.expectString("\xff", r.header("city").?);
+    }
+}
+
+test "request: a control byte in a header value is still refused" {
+    try expectParseError(error.InvalidHeaderLine, "GET / HTTP/1.1\r\nCity: Zu\x00rich\r\n\r\n", .{});
+    try expectParseError(error.InvalidHeaderLine, "GET / HTTP/1.1\r\nCity: Zu\x7frich\r\n\r\n", .{});
+    try expectParseError(error.InvalidHeaderLine, "GET / HTTP/1.1\r\nCity: Zu\x01rich\r\n\r\n", .{});
 }
 
 test "request: header too big" {
